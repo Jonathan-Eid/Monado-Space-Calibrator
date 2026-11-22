@@ -3,9 +3,9 @@
 
 Counterpart of scripts/Test-AppInspection.ps1 for the Linux preview package:
 starts vdxr-calibration --preview, drives the AF_UNIX inspection API and checks
-native state, selections, invalid inputs, preview gates, device model identity
-and clean API shutdown. Frame export is expected to be cleanly rejected: the
-headless Linux build has no renderer (the Windows D3D11 app owns rendering).
+native state, selections, invalid inputs, preview gates, device model identity,
+real offscreen OpenGL frame export (mirror + model catalog) and clean API
+shutdown. The Linux preview renders through EGL/OpenGL offscreen (no window).
 
 Usage: test-app-inspection.py --package-dir PATH [--python /usr/bin/python3]
 """
@@ -41,6 +41,18 @@ def wait_for_preview(pid: int, attempts: int = 60) -> dict:
             pass
         time.sleep(0.1)
     raise AssertionError(f"Preview did not initialize; last state: {state}")
+
+
+def wait_for_export(pid: int, ticket: int, attempts: int = 60) -> bool:
+    for _ in range(attempts):
+        try:
+            state = invoke(pid, {"op": "state"})
+            if state.get("render", {}).get("export_completed", 0) >= ticket:
+                return True
+        except (OSError, ValueError):
+            pass
+        time.sleep(0.1)
+    return False
 
 
 def require(condition: bool, message: str) -> None:
@@ -107,9 +119,15 @@ def main() -> int:
                     and invoke(process.pid, {"op": "state"})["device_models_open"], "Device model view did not open.")
             require(invoke(process.pid, {"op": "show_device_models", "value": 0})["ok"]
                     and not invoke(process.pid, {"op": "state"})["device_models_open"], "Device model view did not close.")
-            # No renderer headlessly: export must be cleanly rejected, never faked.
-            export = invoke(process.pid, {"op": "export_frame", "view": "mirror"})
-            require(not export["ok"] and "renderer" in export["error"], "Frame export was not cleanly rejected.")
+            # Real offscreen OpenGL export: mirror renders the synthetic scene
+            # to PNG; poll state.render.export_completed for the ticket.
+            require(invoke(process.pid, {"op": "export_frame", "view": "mirror"})["ok"], "Mirror export was rejected.")
+            require(wait_for_export(process.pid, 1), "Mirror export did not complete.")
+            require(os.path.getsize(os.path.join(package, "data/inspection/mirror.png")) > 1000, "Mirror PNG is implausibly small.")
+            require(invoke(process.pid, {"op": "export_frame", "view": "model_catalog"})["ok"], "Model catalog export was rejected.")
+            require(wait_for_export(process.pid, 2), "Model catalog export did not complete.")
+            require(os.path.getsize(os.path.join(package, "data/inspection/model-catalog.png")) > 1000, "Model catalog PNG is implausibly small.")
+            require(invoke(process.pid, {"op": "export_frame", "view": "bogus"})["ok"] is False, "Unknown export view was accepted.")
             # Synthetic devices are reported, with tracker and controllers tracked.
             devices = {entry["name"]: entry for entry in invoke(process.pid, {"op": "state"})["devices"]}
             require(devices["head"]["tracked"] and devices["left_controller"]["tracked"]
@@ -122,7 +140,7 @@ def main() -> int:
             if process is not None and process.poll() is None:
                 process.kill()
                 process.wait()
-        print("Passed: native state, selections, Quest 2/3 mesh verification, invalid inputs, preview gates, export rejection and API shutdown.")
+        print("Passed: native state, selections, Quest 2/3 mesh verification, invalid inputs, preview gates, offscreen OpenGL exports (mirror + model catalog) and API shutdown.")
         return 0
     finally:
         for path, saved in settings.items():

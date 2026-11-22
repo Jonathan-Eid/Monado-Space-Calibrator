@@ -24,14 +24,21 @@ if(WIN32)
   target_compile_options(vdxr-calibration PRIVATE /bigobj)
   target_link_libraries(vdxr-calibration PRIVATE calibration-imgui "${SURVIVE_LIBRARY}" d3d11 dxgi d3dcompiler shell32 windowscodecs ole32)
 else()
-  # Linux: same model logic, inspection API and IPC, but headless preview app
-  # (no D3D11 window, no OpenXR runtime; see BUILD-LINUX.md).
+  # Linux: Monado/OpenXR (via src/calibration_xr.h Linux branch) + OpenGL
+  # offscreen renderer (src/calibration_scene.h Linux branch). No D3D11,
+  # no Win32 HWND: preview renders offscreen through EGL/FBOs, no window.
+  # The OpenXR loader is found at runtime (dlopen libopenxr.so.1); the app
+  # does not link libopenxr (see Monado detection in calibration_xr.h).
   find_package(Threads REQUIRED)
+  find_package(OpenGL REQUIRED COMPONENTS OpenGL EGL)
+  find_library(WAYLAND_CLIENT_LIBRARY wayland-client REQUIRED)
   add_executable(vdxr-calibration src/calibration_app_headless.cpp external/cJSON/cJSON.c)
-  target_include_directories(vdxr-calibration PRIVATE include "${EIGEN_INCLUDE_DIR}" external/cJSON
+  target_include_directories(vdxr-calibration PRIVATE include "${EIGEN_INCLUDE_DIR}" external/cJSON external external/OpenXR-SDK/include
     "${SURVIVE_SOURCE}/include" "${SURVIVE_SOURCE}/redist" "${SURVIVE_SOURCE}/libs/cnmatrix/include")
   target_compile_definitions(vdxr-calibration PRIVATE USE_DOUBLE)
-  target_link_libraries(vdxr-calibration PRIVATE Threads::Threads "${SURVIVE_LIBRARY}")
+  target_link_libraries(vdxr-calibration PRIVATE Threads::Threads "${SURVIVE_LIBRARY}"
+    OpenGL::GL OpenGL::EGL "${WAYLAND_CLIENT_LIBRARY}" ${CMAKE_DL_LIBS})
+  target_compile_options(vdxr-calibration PRIVATE -Wno-unused-parameter)
   # The packaged app finds libsurvive.so.0 next to the executable, like the
   # Windows package places libsurvive.dll beside the exe.
   set_target_properties(vdxr-calibration PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
@@ -46,6 +53,12 @@ add_test(NAME calibration-math COMMAND calibration-math-test)
 add_executable(device-identity-test src/device_identity_test.cpp external/cJSON/cJSON.c)
 target_include_directories(device-identity-test PRIVATE "${EIGEN_INCLUDE_DIR}" external/cJSON)
 add_test(NAME device-identity COMMAND device-identity-test)
+if(NOT WIN32)
+  # Portable scene-math coverage for the Linux OpenGL renderer (no GL context).
+  add_executable(renderer-math-test src/renderer_math_test.cpp)
+  target_include_directories(renderer-math-test PRIVATE "${EIGEN_INCLUDE_DIR}" external)
+  add_test(NAME renderer-math COMMAND renderer-math-test)
+endif()
 add_executable(calibration-replay src/calibration_replay.cpp external/cJSON/cJSON.c)
 target_include_directories(calibration-replay PRIVATE "${EIGEN_INCLUDE_DIR}" external/cJSON)
 add_executable(survive-import-test src/survive_import_test.cpp)

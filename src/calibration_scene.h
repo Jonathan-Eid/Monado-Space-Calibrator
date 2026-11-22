@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #pragma once
+#ifdef WIN32
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -171,3 +172,234 @@ float4 PS(Output i):SV_TARGET { return textured>.5 ? float4(image.Sample(samp,i.
     }
 };
 } // namespace scene
+#else
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#ifndef GL_GLEXT_PROTOTYPES
+#define GL_GLEXT_PROTOTYPES 1
+#endif
+#include <GL/gl.h>
+#include <GL/glcorearb.h>
+#include <wayland-client.h>
+#include <cstdio>
+#include <cstdlib>
+#include <Eigen/Dense>
+#include <cstring>
+#include <map>
+#include <utility>
+#include <vector>
+#include <stdexcept>
+#include <string>
+#include <cmath>
+#include <cstddef>
+#include "calibration_math.h"
+
+namespace scene {
+using calibration::Pose;
+struct Vertex { float p[3]; float c[4]; float uv[2]; };
+struct Color { float x,y,z,w; };
+inline const Color White{.88f,.91f,.94f,1}, Dark{.07f,.11f,.14f,1}, Teal{.08f,.65f,.7f,1}, Orange{.95f,.43f,.12f,1};
+inline Eigen::Matrix4f matrix(const Pose& pose) { return pose.matrix().cast<float>(); }
+inline Eigen::Vector3d point(const Pose& pose,double x,double y,double z) { return pose*Eigen::Vector3d(x,y,z); }
+inline Vertex vertex(const Eigen::Vector3d& p,Color color,float u=0,float v=0) { Vertex out{};out.p[0]=float(p.x());out.p[1]=float(p.y());out.p[2]=float(p.z());out.c[0]=color.x;out.c[1]=color.y;out.c[2]=color.z;out.c[3]=color.w;out.uv[0]=u;out.uv[1]=v;return out; }
+inline void line(std::vector<Vertex>& out,const Eigen::Vector3d& a,const Eigen::Vector3d& b,Color color) { out.push_back(vertex(a,color)); out.push_back(vertex(b,color)); }
+inline void axes(std::vector<Vertex>& out,const Pose& pose,double size=.1) {
+    line(out,pose.translation(),point(pose,size,0,0),{.85f,.15f,.1f,1});
+    line(out,pose.translation(),point(pose,0,size,0),{.1f,.65f,.2f,1});
+    line(out,pose.translation(),point(pose,0,0,size),{.1f,.3f,.85f,1});
+}
+inline void ellipsoid(std::vector<Vertex>& out,const Pose& pose,Eigen::Vector3d center,Eigen::Vector3d radii,Color color) {
+    constexpr int n=16,m=10;
+    const auto p=[&](int a,int b) -> Eigen::Vector3d {
+        const double u=a*6.283185307179586/n,v=b*3.141592653589793/m;
+        Eigen::Vector3d q(std::sin(v)*std::cos(u),std::cos(v),std::sin(v)*std::sin(u));
+        return pose*(center+q.cwiseProduct(radii));
+    };
+    for(int b=0;b<m;++b) for(int a=0;a<n;++a) {
+        const Eigen::Vector3d points[]{p(a,b),p(a+1,b),p(a+1,b+1),p(a,b),p(a+1,b+1),p(a,b+1)};
+        const float shade=.72f+.28f*float(std::sin((b+.5)*3.141592653589793/m));
+        const Color c{color.x*shade,color.y*shade,color.z*shade,1};
+        for(const auto& q:points) out.push_back(vertex(q,c));
+    }
+}
+inline void controller(std::vector<Vertex>& out,const Pose& pose,bool left,bool ghost=false) {
+    const auto body=ghost ? Teal : White;
+    ellipsoid(out,pose,{0,-.025,.025},{.022,.07,.024},body);
+    ellipsoid(out,pose,{0,.025,-.025},{.038,.015,.047},body);
+    ellipsoid(out,pose,{0,.038,-.026},{.032,.005,.04},ghost ? Teal : Dark);
+    const double side=left ? -1 : 1;
+    ellipsoid(out,pose,{side*.014,.047,-.032},{.008,.007,.008},ghost ? Teal : Dark);
+    ellipsoid(out,pose,{-side*.014,.044,-.019},{.005,.003,.005},ghost ? Teal : White);
+    ellipsoid(out,pose,{-side*.019,.044,-.037},{.005,.003,.005},ghost ? Teal : White);
+}
+inline void tracker(std::vector<Vertex>& out,const Pose& pose,Color color=Dark) {
+    ellipsoid(out,pose,{0,.009,0},{.031,.012,.031},color);
+    for(int i=0;i<3;++i) {
+        const double a=i*6.283185307179586/3;
+        ellipsoid(out,pose,{.027*std::sin(a),.017,.027*std::cos(a)},{.015,.014,.015},color);
+    }
+    ellipsoid(out,pose,{0,.023,0},{.009,.002,.009},Teal);
+}
+inline std::vector<Vertex> panel(const Pose& pose,float width,float height) {
+    std::vector<Vertex> out;
+    const auto add=[&](float x,float y,float u,float v) { out.push_back(vertex(point(pose,x,y,0),{1,1,1,1},u,v)); };
+    const float x=width/2,y=height/2;
+    add(-x,y,0,0);add(x,y,1,0);add(x,-y,1,1);add(-x,y,0,0);add(x,-y,1,1);add(-x,-y,0,1);
+    return out;
+}
+inline std::string glError(const char* what) {
+    const GLenum code=glGetError();
+    return std::string(what)+": GL error "+std::to_string(code);
+}
+inline void glCheck(const char* what) { if(glGetError()!=GL_NO_ERROR) throw std::runtime_error(glError(what)); }
+
+struct RenderTarget { GLuint fbo{},texture{},depthRenderbuffer{}; int width{},height{}; };
+
+class Renderer {
+    EGLDisplay display = EGL_NO_DISPLAY;
+    EGLContext context = EGL_NO_CONTEXT;
+    EGLSurface surface = EGL_NO_SURFACE;
+    wl_display* wayland = nullptr;
+    GLuint program{},vao{},vbo{};
+    std::map<std::pair<int,int>,GLuint> depthBuffers;
+    GLuint depthFor(int width,int height) {
+        const auto key=std::make_pair(width,height);
+        const auto found=depthBuffers.find(key);
+        if(found!=depthBuffers.end()) return found->second;
+        GLuint buffer{};glGenRenderbuffers(1,&buffer);glBindRenderbuffer(GL_RENDERBUFFER,buffer);glRenderbufferStorage(GL_RENDERBUFFER,GL_DEPTH_COMPONENT24,width,height);
+        depthBuffers[key]=buffer;glBindRenderbuffer(GL_RENDERBUFFER,0);return buffer;
+    }
+public:
+    EGLDisplay eglDisplay() const { return display; }
+    EGLContext eglContext() const { return context; }
+    wl_display* wlDisplay() const { return wayland; }
+    void init() {
+        display = eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, nullptr);
+        bool surfaceless = display!=EGL_NO_DISPLAY && eglInitialize(display,nullptr,nullptr);
+        if(!surfaceless) {
+            if(display!=EGL_NO_DISPLAY) eglTerminate(display);
+            wayland = wl_display_connect(nullptr);
+            if(wayland) display = eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR, wayland, nullptr);
+            if(display==EGL_NO_DISPLAY) display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+            if(display==EGL_NO_DISPLAY||!eglInitialize(display,nullptr,nullptr)) throw std::runtime_error("Create EGL display (surfaceless and Wayland both failed)");
+        }
+        eglBindAPI(EGL_OPENGL_API);
+        // Mesa's surfaceless platform offers only a subset of surface types;
+        // relax the surface-type requirement when no config matches.
+        EGLConfig config{};
+        const EGLint candidates[][15] = {
+            {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT, EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_DEPTH_SIZE, 24, EGL_NONE},
+            {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT, EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE},
+            {EGL_SURFACE_TYPE, EGL_DONT_CARE, EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT, EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_DEPTH_SIZE, 24, EGL_NONE},
+        };
+        bool found = false;
+        for(const auto& attributes : candidates) {
+            EGLint count{};
+            if(eglChooseConfig(display,attributes,&config,1,&count)&&count){found=true;break;}
+        }
+        if(!found) throw std::runtime_error("Choose EGL config");
+        const EGLint contextAttributes[] = {EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT, EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 3, EGL_NONE};
+        context =        eglCreateContext(display,config,EGL_NO_CONTEXT,contextAttributes);
+        if(context==EGL_NO_CONTEXT) throw std::runtime_error("Create EGL context");
+        // A pbuffer must be current for FBO rendering on Mesa, even when the
+        // display itself is the surfaceless platform (a bare EGL_NO_SURFACE
+        // current context silently discards draws in some Mesa versions).
+        const EGLint surfaceAttributes[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
+        surface = eglCreatePbufferSurface(display,config,surfaceAttributes);
+        if(surface==EGL_NO_SURFACE) throw std::runtime_error("Create preview surface");
+        eglMakeCurrent(display,surface,surface,context);
+        static const char vertexShader[] =
+            "#version 330 core\n"
+            "layout(location=0) in vec3 p;\n"
+            "layout(location=1) in vec4 c;\n"
+            "layout(location=2) in vec2 uv;\n"
+            "uniform mat4 vp;\nuniform float textured;\n"
+            "out vec4 color;out vec2 v_uv;out float v_textured;\n"
+            "void main(){gl_Position=vp*vec4(p,1.0);color=c;v_uv=uv;v_textured=textured;}\n";
+        static const char fragmentShader[] =
+            "#version 330 core\n"
+            "in vec4 color;in vec2 v_uv;in float v_textured;\n"
+            "uniform sampler2D image;\n"
+            "out vec4 frag;\n"
+            "void main(){frag=v_textured>.5?vec4(texture(image,v_uv).rgb*color.rgb,1.0):color;}\n";
+        const auto compile=[&](GLenum type,const char* source,const char* name) {
+            const GLuint shader=glCreateShader(type);glShaderSource(shader,1,&source,nullptr);glCompileShader(shader);
+            GLint status{};glGetShaderiv(shader,GL_COMPILE_STATUS,&status);
+            if(!status){GLchar log[1024]{};glGetShaderInfoLog(shader,sizeof(log),nullptr,log);glDeleteShader(shader);throw std::runtime_error(std::string("Compile ")+name+": "+log);}
+            return shader;
+        };
+        const GLuint vs=compile(GL_VERTEX_SHADER,vertexShader,"scene vertex shader");
+        const GLuint fs=compile(GL_FRAGMENT_SHADER,fragmentShader,"scene fragment shader");
+        program=glCreateProgram();glAttachShader(program,vs);glAttachShader(program,fs);glLinkProgram(program);
+        GLint status{};glGetProgramiv(program,GL_LINK_STATUS,&status);
+        if(!status){GLchar log[1024]{};glGetProgramInfoLog(program,sizeof(log),nullptr,log);throw std::runtime_error(std::string("Link scene program: ")+log);}
+        glDeleteShader(vs);glDeleteShader(fs);
+        glGenVertexArrays(1,&vao);glBindVertexArray(vao);
+        glGenBuffers(1,&vbo);glBindBuffer(GL_ARRAY_BUFFER,vbo);
+        glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,sizeof(Vertex),(const void*)offsetof(Vertex,p));
+        glVertexAttribPointer(1,4,GL_FLOAT,GL_FALSE,sizeof(Vertex),(const void*)offsetof(Vertex,c));
+        glVertexAttribPointer(2,2,GL_FLOAT,GL_FALSE,sizeof(Vertex),(const void*)offsetof(Vertex,uv));
+        glEnableVertexAttribArray(0);glEnableVertexAttribArray(1);glEnableVertexAttribArray(2);
+        glBindVertexArray(0);glBindBuffer(GL_ARRAY_BUFFER,0);
+    }
+    RenderTarget createTarget(int width,int height) {
+        RenderTarget target;target.width=width;target.height=height;
+        glGenFramebuffers(1,&target.fbo);glBindFramebuffer(GL_FRAMEBUFFER,target.fbo);
+        glGenTextures(1,&target.texture);glBindTexture(GL_TEXTURE_2D,target.texture);
+        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,width,height,0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
+        glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,target.texture,0);
+        GLuint depth{};glGenRenderbuffers(1,&depth);glBindRenderbuffer(GL_RENDERBUFFER,depth);glRenderbufferStorage(GL_RENDERBUFFER,GL_DEPTH_COMPONENT24,width,height);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_RENDERBUFFER,depth);
+        target.depthRenderbuffer=depth;
+        if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE){glBindFramebuffer(GL_FRAMEBUFFER,0);throw std::runtime_error("Create framebuffer");}
+        glBindFramebuffer(GL_FRAMEBUFFER,0);glBindTexture(GL_TEXTURE_2D,0);
+        return target;
+    }
+    void setTarget(GLuint target,int width,int height,bool useDepth=true) {
+        glBindFramebuffer(GL_FRAMEBUFFER,target);
+        if(useDepth) {
+            const GLuint depth=depthFor(width,height);
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_RENDERBUFFER,depth);
+        } else glFramebufferRenderbuffer(GL_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_RENDERBUFFER,0);
+        glViewport(0,0,width,height);
+        glDisable(GL_SCISSOR_TEST);glDisable(GL_STENCIL_TEST);
+        if(useDepth){glEnable(GL_DEPTH_TEST);glDepthFunc(GL_LEQUAL);glDepthMask(GL_TRUE);}else glDisable(GL_DEPTH_TEST);
+        glClearColor(.78f,.84f,.88f,1);
+        glClear(GL_COLOR_BUFFER_BIT|(useDepth?GL_DEPTH_BUFFER_BIT:0));
+        glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE) throw std::runtime_error("Bind framebuffer target");
+    }
+    void unbindTarget() { glBindFramebuffer(GL_FRAMEBUFFER,0); glBindTexture(GL_TEXTURE_2D,0); }
+    void exportPng(GLuint target,int width,int height,const char* path) {
+        glBindFramebuffer(GL_FRAMEBUFFER,target);
+        glFinish();
+        std::vector<unsigned char> pixels(size_t(width)*height*4);
+        glReadPixels(0,0,width,height,GL_RGBA,GL_UNSIGNED_BYTE,pixels.data());
+        glBindFramebuffer(GL_FRAMEBUFFER,0);
+        std::vector<unsigned char> flipped(pixels.size());
+        const size_t row=size_t(width)*4;
+        for(int y=0;y<height;++y) std::memcpy(flipped.data()+size_t(y)*row,pixels.data()+size_t(height-1-y)*row,row);
+        if(stbi_write_png(path,width,height,4,flipped.data(),int(row))==0) throw std::runtime_error("Write PNG export");
+    }
+    void draw(const std::vector<Vertex>& data,const Eigen::Matrix4f& vp,bool lines=false,GLuint texture=0,bool overlay=false) {
+        (void)overlay;
+        if(data.empty())return;
+        if(data.size()>100000)throw std::runtime_error("Scene vertex capacity exceeded");
+        glUseProgram(program);
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ARRAY_BUFFER,vbo);
+        glBufferData(GL_ARRAY_BUFFER,GLsizeiptr(data.size()*sizeof(Vertex)),data.data(),GL_STREAM_DRAW);
+        glUniformMatrix4fv(glGetUniformLocation(program,"vp"),1,GL_FALSE,vp.data());
+        glUniform1f(glGetUniformLocation(program,"textured"),texture?1:0);
+        if(texture){glActiveTexture(GL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,texture);glUniform1i(glGetUniformLocation(program,"image"),0);}
+        if(overlay){glEnable(GL_DEPTH_TEST);glDepthFunc(GL_LEQUAL);glDepthMask(GL_FALSE);}else {glEnable(GL_DEPTH_TEST);glDepthFunc(GL_LEQUAL);glDepthMask(GL_TRUE);}
+        glDrawArrays(lines?GL_LINES:GL_TRIANGLES,0,GLsizei(data.size()));
+        if(texture){glBindTexture(GL_TEXTURE_2D,0);}
+        glBindVertexArray(0);glBindBuffer(GL_ARRAY_BUFFER,0);glUseProgram(0);
+        if(glGetError()!=GL_NO_ERROR) throw std::runtime_error("Draw scene");
+    }
+};
+} // namespace scene
+
+#endif

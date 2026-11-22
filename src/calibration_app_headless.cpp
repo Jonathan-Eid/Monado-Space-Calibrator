@@ -1,10 +1,19 @@
 // SPDX-License-Identifier: MIT
-// Linux headless port of the regular calibration app.
+// Linux (Monado/OpenXR + OpenGL) port of the regular calibration app.
 // Windows runs the full D3D11/OpenXR app (see calibration_app.cpp); this
-// variant keeps the same model logic, inspection API and IPC, but runs
-// synthetic preview without a window, GPU renderer or OpenXR runtime. It is
-// the offline/CI pipeline for Linux; hardware Quest-space calibration needs
-// the VDXR OpenXR runtime, which is Windows-only (see BUILD-LINUX.md).
+// variant keeps the same model logic, inspection API and IPC, runs the same
+// synthetic preview, and renders offscreen through EGL/OpenGL (no window).
+// The hardware path creates its session through src/calibration_xr.h
+// (xrCreateInstance via the standard OpenXR loader, Monado runtime) with an
+// OpenGL swapchain binding; without a runtime it fails cleanly citing the
+// missing Monado runtime (see BUILD-LINUX.md).
+#define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <stb_image_write.h>
+#include "calibration_xr.h"
+#include "calibration_scene.h"
+#include "device_models.h"
+
 #include "calibration_math.h"
 #include "spacecal_regular.h"
 #include "calibration_inspection.h"
@@ -27,10 +36,12 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <thread>
 
 using namespace calibration;
+using namespace scene;
 namespace fs=std::filesystem;
 using Clock=std::chrono::steady_clock;
 static constexpr size_t FastCaptureSamples=100,SlowCaptureSamples=250,ValidationSamples=50;
@@ -53,58 +64,13 @@ static void atomicWrite(const fs::path& path,const std::string& contents) {
     if(code)throw std::runtime_error("Cannot finish profile save");
 }
 
-// Offline device model verification. The Windows library uploads meshes and
-// textures to D3D11; headless has no renderer, so batches are parsed and
-// validated (bounds, finiteness, count limits) and textures are only checked
-// for presence. state.device_models.asset_loaded reports mesh integrity, and
-// asset_error states that textures are not decoded here.
-class HeadlessAssets {
-public:
-    struct Asset { size_t batches=0;std::string error;bool loaded()const{return batches>0;} };
-    void init() {
-        for(const auto* model:{"meta-quest-touch-plus","oculus-touch-v3","meta-quest-touch-pro"})
-            for(const auto* side:{"left","right"})load(std::string(model)+"-"+side);
-        load("vive-tracker-3");
-    }
-    void load(const std::string& key) {
-        Asset asset;
-        try {
-            fs::path path=fs::path("assets/models")/(key+".vdm");
-            // Manufacturer assets imported by the owner stay private and out of source control.
-            if(key=="vive-tracker-3")path="data/models/vive-tracker-3.vdm";
-            std::ifstream file(path,std::ios::binary);if(!file)throw std::runtime_error("Asset not installed");
-            auto read=[&](void* output,size_t size){if(!file.read(static_cast<char*>(output),size))throw std::runtime_error("Truncated device asset");};
-            uint32_t header[3];read(header,sizeof(header));
-            if(header[0]!=0x314d4456||header[1]!=1||!header[2]||header[2]>64)throw std::runtime_error("Invalid device asset header");
-            for(uint32_t i=0;i<header[2];++i) {
-                uint32_t count,size;read(&count,4);read(&size,4);
-                if(!count||count%3||count>100000||size>16*1024*1024)throw std::runtime_error("Device asset bounds exceeded");
-                static_assert(sizeof(sceneVertex)==36);
-                if(count*sizeof(sceneVertex)>64*1024*1024)throw std::runtime_error("Device asset bounds exceeded");
-                std::vector<char> vertices(count*sizeof(sceneVertex));read(vertices.data(),vertices.size());
-                for(size_t v=0;v<count;++v) {
-                    const float* values=reinterpret_cast<const float*>(vertices.data()+v*sizeof(sceneVertex));
-                    for(int j=0;j<9;++j)if(!std::isfinite(values[j]))throw std::runtime_error("Nonfinite model vertex");
-                    if(std::abs(values[0])>1||std::abs(values[1])>1||std::abs(values[2])>1)throw std::runtime_error("Device dimensions exceeded");
-                }
-                if(size)file.seekg(size,std::ios::cur); // texture present, not decoded headlessly
-                if(!file)throw std::runtime_error("Truncated device asset");
-                ++asset.batches;
-            }
-        }catch(const std::exception& error){asset.batches=0;asset.error=error.what();}
-        assets[key]=std::move(asset);
-    }
-    const Asset* find(const std::string& key)const {const auto i=assets.find(key);return i==assets.end()?nullptr:&i->second;}
-    bool loaded(const std::string& key)const {const auto* asset=find(key);return asset&&asset->loaded();}
-private:
-    struct sceneVertex{float p[3],c[4];float uv[2];}; // same layout as the Windows renderer vertex
-    std::map<std::string,Asset> assets;
-};
-
-struct Located { Pose pose{Pose::Identity()}; uint32_t flags{}; bool tracked() const { return (flags&15)==15; } };
 struct RawPose { Pose pose{Pose::Identity()}; device_models::Identity identity; double sampleTime{},age{}; Clock::time_point received{}; bool fresh() const { return sampleTime>0 && std::chrono::duration<double>(Clock::now()-received).count()+age<.1; } };
 enum class Step { Devices,Capture,Fitting,Validate,Ready,Saved,Error };
 struct Model {
+    Renderer* renderer{};
+    RenderTarget mirrorTarget,eyeTarget,catalogTarget;
+    bool rendererReady=false;
+    std::string rendererError;
     SurviveSimpleContext* source{};
     std::future<SurviveSimpleContext*> hardware;
     std::future<Fit> pendingFit;
@@ -123,13 +89,15 @@ struct Model {
     double validationRotation{};
     Fit result;
     Located head,grips[2];
-    HeadlessAssets models;
+    device_models::Library models;
     device_models::Identity controllerIdentity[2];
     std::string controllerOverride[2]{"auto","auto"},systemName,interactionProfiles[2];
     bool modelSettings=false;
     bool fastMode=true;
     external_trackers::OwnerLock ipcOwner;
     external_trackers::Writer ipc;
+    Pose panelPose{Pose::Identity()},rawAnchor{Pose::Identity()},rawOrigin{Pose::Identity()};
+    bool placed=false,rawPlaced=false;
     size_t captureTarget()const{return fastMode ? FastCaptureSamples:SlowCaptureSamples;}
     Clock::time_point inspectionStarted=Clock::now();
     std::string controllerKey(int side)const{return controllerIdentity[side].model+(side ? "-right":"-left");}
@@ -176,7 +144,7 @@ struct Model {
         else if(action=="identify_reference")return false; // haptics need the OpenXR session; never faked headlessly
         else if(action=="lock_map"){auto* previous=source;source=nullptr;devices.clear();initHardware(true,previous);}
         else if(action=="exit")exitRequested=true;
-        else if(action=="place_panel"){} // no panel geometry without a renderer; kept for protocol parity
+        else if(action=="place_panel"){} // no panel geometry headlessly; kept for protocol parity
         return true;
     }
     ~Model() {
@@ -306,7 +274,64 @@ struct Model {
     }
 };
 
-static std::string snapshot(Model& model,uint64_t frame) {
+static Eigen::Matrix4f perspectiveFov(float fovY,float aspect,float nearPlane=.05f,float farPlane=50.f) {
+    const float t=std::tan(fovY/2);
+    Eigen::Matrix4f m=Eigen::Matrix4f::Identity();
+    m(0,0)=1/(aspect*t);m(1,1)=1/t;m(2,2)=(farPlane+nearPlane)/(nearPlane-farPlane);m(2,3)=2*farPlane*nearPlane/(nearPlane-farPlane);m(3,2)=-1;
+    return m;
+}
+static Eigen::Matrix4f lookAt(const Eigen::Vector3d& eye,const Eigen::Vector3d& target,const Eigen::Vector3d& up) {
+    const Eigen::Vector3d forward=(target-eye).normalized(),side=forward.cross(up).normalized(),trueUp=side.cross(forward);
+    Eigen::Matrix4f rotation=Eigen::Matrix4f::Identity();
+    rotation(0,0)=side.x();rotation(0,1)=side.y();rotation(0,2)=side.z();rotation(0,3)=0;
+    rotation(1,0)=trueUp.x();rotation(1,1)=trueUp.y();rotation(1,2)=trueUp.z();rotation(1,3)=0;
+    rotation(2,0)=-forward.x();rotation(2,1)=-forward.y();rotation(2,2)=-forward.z();rotation(2,3)=0;
+    Eigen::Matrix4f translation=Eigen::Matrix4f::Identity();
+    translation(0,3)=-side.dot(eye);translation(1,3)=-trueUp.dot(eye);translation(2,3)=forward.dot(eye);
+    return translation*rotation;
+}
+static void buildSceneGeometry(Model& m,std::vector<Vertex>& triangles,std::vector<Vertex>& lines) {
+    for(int i=-16;i<=16;++i){const double x=i*.25;line(lines,{x,0,-4},{x,0,4},{.48f,.58f,.63f,1});line(lines,{-4,0,x},{4,0,x},{.48f,.58f,.63f,1});}
+    axes(lines,Pose::Identity(),.3);
+    for(int side=0;side<2;++side)if(m.grips[side].tracked()){if(!m.models.loaded(m.controllerKey(side)))controller(triangles,m.grips[side].pose,side==0);axes(lines,m.grips[side].pose,.07);}
+    auto* raw=m.raw();if(raw&&raw->fresh()) {
+        if(!m.rawPlaced&&m.placed){m.rawOrigin=raw->pose;m.rawPlaced=true;}
+        const Pose world=m.hasFit ? m.result.world:Pose(m.rawAnchor*m.rawOrigin.inverse());
+        for(const auto& entry:m.devices)if(entry.second.fresh()){const Pose p=world*entry.second.pose;if(!m.models.loaded(entry.second.identity.model))tracker(triangles,p,entry.first==m.selected ? Teal:Dark);axes(lines,p,.07);}
+        const Pose p=world*raw->pose;
+        if(m.hasFit){const Pose predicted=p*m.result.mount;if(!m.models.loaded(m.controllerKey(m.reference)))controller(triangles,predicted,m.reference==0,true);line(lines,predicted.translation(),m.grips[m.reference].pose.translation(),Orange);}
+    }
+}
+static void renderDevices(Model& m,Renderer& renderer,const Eigen::Matrix4f& vp) {
+    for(int side=0;side<2;++side)if(m.grips[side].tracked())m.models.draw(renderer,m.controllerKey(side),m.grips[side].pose,vp);
+    auto* raw=m.raw();if(!raw||!raw->fresh())return;
+    const Pose world=m.hasFit ? m.result.world:Pose(m.rawAnchor*m.rawOrigin.inverse());
+    for(const auto& entry:m.devices)if(entry.second.fresh())m.models.draw(renderer,entry.second.identity.model,Pose(world*entry.second.pose),vp);
+    if(m.hasFit)m.models.draw(renderer,m.controllerKey(m.reference),Pose(world*raw->pose*m.result.mount),vp,true);
+}
+static void renderFrame(Model& m,RenderTarget& target,const Eigen::Matrix4f& vp) {
+    Renderer* renderer=m.renderer;
+    std::vector<Vertex> triangles,lines;
+    buildSceneGeometry(m,triangles,lines);
+    renderer->setTarget(target.fbo,target.width,target.height);
+    renderer->draw(triangles,vp);
+    renderer->draw(lines,vp,true);
+    renderDevices(m,*renderer,vp);
+    renderer->unbindTarget();
+}
+static void renderModelCatalog(Model& m,RenderTarget& target) {
+    Renderer* renderer=m.renderer;
+    const Eigen::Vector3d eye(0,.36f,.52f),look(0,0,0);
+    const auto proj=perspectiveFov(.9f,1280.f/840,.01f,5);
+    const auto view=lookAt(eye,look,Eigen::Vector3d::UnitY());
+    const auto vp=proj*view;
+    renderer->setTarget(target.fbo,target.width,target.height);
+    const char* keys[]{"meta-quest-touch-plus-left","meta-quest-touch-plus-right","oculus-touch-v3-left","oculus-touch-v3-right","vive-tracker-3"};
+    for(int i=0;i<5;++i){Pose pose=Pose::Identity();pose.translation()=Eigen::Vector3d(i<2 ? -.22:i<4 ? 0:.22,0,i<4 ? (i%2 ? .09:-.09):0);m.models.draw(*renderer,keys[i],pose,vp);}
+    renderer->unbindTarget();
+}
+
+static std::string snapshot(Model& model,uint64_t frame,uint64_t requested,uint64_t exported,const std::string& exportPath) {
     cJSON* root=cJSON_CreateObject();cJSON_AddNumberToObject(root,"schema",1);cJSON_AddNumberToObject(root,"pid",double(getpid()));cJSON_AddNumberToObject(root,"frame",double(frame));cJSON_AddNumberToObject(root,"uptime_ms",std::chrono::duration<double,std::milli>(Clock::now()-model.inspectionStarted).count());
     cJSON_AddStringToObject(root,"mode",model.preview ? "synthetic_preview":model.service ? "fixed_tracking_service":"hardware_vr");cJSON_AddStringToObject(root,"phase",model.phase());cJSON_AddStringToObject(root,"message",model.message.c_str());
     cJSON_AddStringToObject(root,"reference",model.reference ? "right":"left");cJSON_AddStringToObject(root,"tracker",model.selected.c_str());cJSON_AddStringToObject(root,"role",external_trackers::Roles[model.role]);cJSON_AddBoolToObject(root,"map_locked",model.mapLocked);cJSON_AddBoolToObject(root,"has_fit",model.hasFit);
@@ -323,11 +348,11 @@ static std::string snapshot(Model& model,uint64_t frame) {
     cJSON_AddBoolToObject(root,"fast_mode",model.fastMode);cJSON_AddNumberToObject(root,"capture_target_samples",double(model.captureTarget()));cJSON_AddNumberToObject(root,"validation_target_samples",double(ValidationSamples));cJSON_AddNumberToObject(root,"sample_rate_hz",1/SampleInterval);
     cJSON_AddBoolToObject(root,"device_models_open",model.modelSettings);
     cJSON* identities=cJSON_AddArrayToObject(root,"device_models");
-    const auto identity=[&](const std::string& device,const device_models::Identity& id,const std::string& key,const std::string& choice){cJSON* item=cJSON_CreateObject();cJSON_AddStringToObject(item,"device",device.c_str());cJSON_AddStringToObject(item,"model_id",id.model.c_str());cJSON_AddStringToObject(item,"name",id.name.c_str());cJSON_AddStringToObject(item,"identity_source",id.source.c_str());cJSON_AddStringToObject(item,"reported",id.reported.c_str());cJSON_AddStringToObject(item,"selection",choice.c_str());cJSON_AddStringToObject(item,"asset_key",key.c_str());const auto* asset=model.models.find(key);cJSON_AddBoolToObject(item,"asset_loaded",asset&&asset->loaded());cJSON_AddStringToObject(item,"asset_error",asset ? (asset->loaded() ? "headless: mesh verified, textures not decoded (no renderer)":asset->error.c_str()):"No matching model");cJSON_AddBoolToObject(item,"generic_fallback",!asset||!asset->loaded());cJSON_AddItemToArray(identities,item);};
+    const auto identity=[&](const std::string& device,const device_models::Identity& id,const std::string& key,const std::string& choice){cJSON* item=cJSON_CreateObject();cJSON_AddStringToObject(item,"device",device.c_str());cJSON_AddStringToObject(item,"model_id",id.model.c_str());cJSON_AddStringToObject(item,"name",id.name.c_str());cJSON_AddStringToObject(item,"identity_source",id.source.c_str());cJSON_AddStringToObject(item,"reported",id.reported.c_str());cJSON_AddStringToObject(item,"selection",choice.c_str());cJSON_AddStringToObject(item,"asset_key",key.c_str());const auto* asset=model.models.find(key);cJSON_AddBoolToObject(item,"asset_loaded",asset&&asset->loaded());cJSON_AddStringToObject(item,"asset_error",asset ? (asset->loaded() ? "OpenGL: textured mesh uploaded":asset->error.c_str()):"No matching model");cJSON_AddBoolToObject(item,"generic_fallback",!asset||!asset->loaded());cJSON_AddItemToArray(identities,item);};
     for(int side=0;side<2;++side)identity(side ? "right_controller":"left_controller",model.controllerIdentity[side],model.controllerKey(side),model.controllerOverride[side]);
     for(const auto& entry:model.devices)identity(entry.first,entry.second.identity,entry.second.identity.model,"auto");
     cJSON* actions=cJSON_AddObjectToObject(root,"actions");for(const char* action: {"select_reference","select_tracker","select_role","select_left_model","select_right_model","show_device_models","set_fast_mode","identify_reference","lock_map","start_capture","fit","start_validation","stop_validation","save_profile","load_profile","reset","start_service","place_panel","exit"})cJSON_AddBoolToObject(actions,action,model.can(action));
-    cJSON* render=cJSON_AddObjectToObject(root,"render");cJSON_AddNumberToObject(render,"export_requested",0);cJSON_AddNumberToObject(render,"export_completed",0);cJSON_AddStringToObject(render,"last_export","");cJSON_AddStringToObject(render,"models","headless Linux: no renderer; device model assets verified offline");
+    cJSON* render=cJSON_AddObjectToObject(root,"render");cJSON_AddNumberToObject(render,"export_requested",double(requested));cJSON_AddNumberToObject(render,"export_completed",double(exported));cJSON_AddStringToObject(render,"last_export",exportPath.c_str());cJSON_AddStringToObject(render,"models",model.rendererReady ? "OpenGL offscreen (EGL, GL 3.3 core); textured meshes uploaded":"renderer unavailable");if(!model.rendererReady)cJSON_AddStringToObject(render,"renderer_error",model.rendererError.c_str());
     return inspectionJson(root);
 }
 
@@ -340,29 +365,46 @@ int main(int argc,char** argv) {
         std::error_code code;fs::current_path(fs::canonical("/proc/self/exe",code).parent_path(),code);
         fs::create_directories("data");
         for(int i=1;i<argc;++i){const std::string arg=argv[i];if(arg=="--preview")preview=true;else if(arg=="--seconds"&&i+1<argc){stopAfter=std::stod(argv[++i]);boundedRun=true;}}
-        if(!preview)
-            throw std::runtime_error("Hardware mode requires the VDXR OpenXR runtime (virtualdesktop-openxr.dll), which is Windows-only. On Linux, run with --preview. Quest connectivity on Linux is a separate follow-up (ALVR/WiVRN runtime integration).");
+        if(!preview) {
+            XrApp xr;
+            xr.init(); // throws cleanly citing the missing Monado runtime when none is bound
+            xr.close();
+            throw std::runtime_error("Monado OpenXR runtime found and created a session, but the full hardware calibration loop is not yet wired in the Linux app -- only --preview is available in this build.");
+        }
+        std::unique_ptr<Renderer> renderer;
         Model model;model.preview=true;
+        try {
+            renderer.reset(new Renderer());renderer->init();
+            model.renderer=renderer.get();model.rendererReady=true;
+            model.models.init();
+            model.mirrorTarget=renderer->createTarget(1280,840);
+            model.eyeTarget=renderer->createTarget(1440,1440);
+            model.catalogTarget=renderer->createTarget(1280,840);
+        }catch(const std::exception& error){model.renderer=nullptr;model.rendererReady=false;model.rendererError=error.what();}
         {std::ifstream file("data/calibration-settings.json");const std::string json((std::istreambuf_iterator<char>(file)),{});cJSON* settings=cJSON_Parse(json.c_str());const auto* value=cJSON_GetObjectItemCaseSensitive(settings,"fast_mode");if(cJSON_IsBool(value))model.fastMode=cJSON_IsTrue(value);cJSON_Delete(settings);}
-        model.models.init();
         {std::ifstream file("data/device-models.json");const std::string json((std::istreambuf_iterator<char>(file)),{});cJSON* saved=cJSON_Parse(json.c_str());for(int side=0;side<2;++side){const auto* value=cJSON_GetObjectItemCaseSensitive(saved,side ? "right":"left");if(cJSON_IsString(value)&&device_models::controllerChoice(value->valuestring))model.controllerOverride[side]=value->valuestring;}cJSON_Delete(saved);}
         model.systemName="Quest 3 (synthetic preview)";model.interactionProfiles[0]=model.interactionProfiles[1]="/interaction_profiles/oculus/touch_controller";
         model.updateIdentities();model.message="Design preview. Calibration and saving are disabled.";
         fs::create_directories("data/inspection");
         const auto started=Clock::now();auto previous=started;
-        uint64_t frameNumber=0;std::string lastLoggedState;
+        uint64_t frameNumber=0,exportRequested=0,exportCompleted=0;std::string pendingExport,lastExport,lastLoggedState;
         while(!exitRequested) {
             inspection.process([&](const std::string& input){
                 cJSON* request=cJSON_Parse(input.c_str());cJSON* operation=cJSON_GetObjectItemCaseSensitive(request,"op");cJSON* reply=cJSON_CreateObject();bool ok=false;
                 if(cJSON_IsString(operation)) {
                     const std::string op=operation->valuestring;
-                    if(op=="export_frame"){cJSON_AddStringToObject(reply,"error","Frame export requires the Windows D3D renderer; the headless Linux preview does not render frames.");}
+                    if(op=="export_frame") {
+                        const cJSON* target=cJSON_GetObjectItemCaseSensitive(request,"view");const std::string view=cJSON_IsString(target) ? target->valuestring:"mirror";
+                        if(!model.rendererReady) cJSON_AddStringToObject(reply,"error","Frame export unavailable: OpenGL renderer failed to initialize.");
+                        else if(pendingExport.empty()&&(view=="mirror"||view=="left_eye"||view=="model_catalog")){pendingExport=view;++exportRequested;ok=true;cJSON_AddBoolToObject(reply,"accepted",true);cJSON_AddNumberToObject(reply,"export_ticket",double(exportRequested));}
+                        else cJSON_AddStringToObject(reply,"error","Export already pending or unknown view");
+                    }
                     else {
                         const cJSON* value=cJSON_GetObjectItemCaseSensitive(request,"value");const int index=cJSON_IsNumber(value) ? value->valueint:0;const std::string text=cJSON_IsString(value) ? value->valuestring:"";
                         if(op!="set_fast_mode"||(cJSON_IsNumber(value)&&(value->valuedouble==0||value->valuedouble==1)))ok=model.perform(op,index,text);
                     }
                 }
-                inspection.update(snapshot(model,frameNumber));
+                inspection.update(snapshot(model,frameNumber,exportRequested,exportCompleted,lastExport));
                 cJSON_Delete(request);cJSON_AddBoolToObject(reply,"ok",ok);cJSON_AddNumberToObject(reply,"frame",double(frameNumber));if(!ok&&!cJSON_HasObjectItem(reply,"error"))cJSON_AddStringToObject(reply,"error","Action unavailable or invalid parameters; inspect state.actions");return inspectionJson(reply);
             });
             const auto now=Clock::now();const double elapsed=std::chrono::duration<double>(now-started).count();
@@ -374,7 +416,37 @@ int main(int argc,char** argv) {
             for(int side=0;side<2;++side){model.grips[side]={Pose::Identity(),15};model.grips[side].pose.translation()=Eigen::Vector3d(side ? .25:-.25,1.05,-.5);model.grips[side].pose.linear()=Eigen::AngleAxisd(-.4,Eigen::Vector3d::UnitX()).toRotationMatrix();}
             RawPose r;r.pose=Pose::Identity();r.pose.translation()=Eigen::Vector3d(.15,1,-.65);r.received=Clock::now();r.sampleTime=1;r.identity={"vive-tracker-3","Vive Tracker 3.0","synthetic preview fixture",""};model.devices["PREVIEW TRACKER"]=r;model.selected="PREVIEW TRACKER";
             model.tick();
-            ++frameNumber;const auto state=snapshot(model,frameNumber);inspection.update(state);
+            if(model.rendererReady&&!pendingExport.empty()) {
+                try {
+                    if(pendingExport=="mirror") {
+                        const auto camera=model.head.pose;
+                        const Eigen::Vector3d eye=camera.translation()+Eigen::Vector3d(0,0,.2),look=camera.translation()+camera.rotation()*Eigen::Vector3d(0,-.45,-.8);
+                        const auto proj=perspectiveFov(1.3f,1280.f/840);
+                        const auto view=lookAt(eye,look,Eigen::Vector3d::UnitY());
+                        const auto vp=proj*view;
+                        renderFrame(model,model.mirrorTarget,vp);
+                        renderer->exportPng(model.mirrorTarget.fbo,1280,840,"data/inspection/mirror.png");
+                        lastExport="data/inspection/mirror.png";
+                    } else if(pendingExport=="left_eye") {
+                        Pose eyePose=model.head.pose;eyePose.translation()+=eyePose.rotation()*Eigen::Vector3d(-.032,0,0);
+                        const Eigen::Matrix4f eyeM=eyePose.matrix().cast<float>().inverse();
+                        const auto proj=perspectiveFov(1.57f,1);
+                        const auto vp=proj*eyeM;
+                        renderFrame(model,model.eyeTarget,vp);
+                        renderer->exportPng(model.eyeTarget.fbo,1440,1440,"data/inspection/left-eye.png");
+                        lastExport="data/inspection/left-eye.png";
+                    } else if(pendingExport=="model_catalog") {
+                        renderModelCatalog(model,model.catalogTarget);
+                        renderer->exportPng(model.catalogTarget.fbo,1280,840,"data/inspection/model-catalog.png");
+                        lastExport="data/inspection/model-catalog.png";
+                    }
+                    pendingExport.clear();exportCompleted=exportRequested;
+                }catch(const std::exception& error){
+                    pendingExport.clear();
+                    model.message=std::string("Frame export failed: ")+error.what();
+                }
+            }
+            ++frameNumber;const auto state=snapshot(model,frameNumber,exportRequested,exportCompleted,lastExport);inspection.update(state);
             const std::string transition=std::string(model.phase())+":"+model.message;
             if(transition!=lastLoggedState){try{atomicWrite("data/inspection/session-state.json",state);std::ofstream events("data/inspection/events.jsonl",std::ios::app);events<<state<<'\n';lastLoggedState=transition;}catch(...){} }
         }

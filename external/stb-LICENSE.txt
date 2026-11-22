@@ -1,0 +1,4 @@
+stb_image.h / stb_image_write.h — Sean Barrett, public domain (CC0-compatible; no warranty implied; use at your own risk). See headers for provenance:
+- https://github.com/nothings/stb/blob/master/stb_image.h
+- https://github.com/nothings/stb/blob/master/stb_image_write.h
+Fetched 2026-11-21 for the Linux OpenGL port: stb_image decodes .vdm PNG textures; stb_image_write encodes frame-export PNGs.

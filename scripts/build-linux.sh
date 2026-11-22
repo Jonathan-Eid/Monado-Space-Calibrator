@@ -18,12 +18,24 @@ command -v "$python" >/dev/null || { echo "$python not found" >&2; exit 1; }
 git -C "$repo" submodule update --init --recursive
 
 # Same importer patch as the Windows build: unsigned 32-bit base-station IDs,
-# binary-safe reads and parse-error propagation are shared C code.
+# binary-safe reads and parse-error propagation are shared C code. In a normal
+# checkout this checks out a git submodule and applies with git; this tree was
+# seeded as a plain working-tree copy (submodule metadata flattened), so fall
+# back to checking the patch markers in the C source: if the patched lines are
+# already present, the tree is already patched.
 survive_source="$repo/external/libsurvive"
 import_patch="$repo/patches/libsurvive-windows-steamvr-import.patch"
+patched_markers_present() {
+    grep -q '(uint32_t)strtoul(json_stack_value(obj), 0, 10)' "$survive_source/src/survive_default_devices.c" \
+        && grep -q 'fopen(filename, "rb")' "$survive_source/src/survive_default_devices.c"
+}
 if git -C "$survive_source" apply --check "$import_patch" 2>/dev/null; then
     git -C "$survive_source" apply "$import_patch"
-elif ! git -C "$survive_source" apply --reverse --check "$import_patch" 2>/dev/null; then
+elif git -C "$survive_source" apply --reverse --check "$import_patch" 2>/dev/null; then
+    : # already applied
+elif patched_markers_present; then
+    echo "libsurvive importer patch already applied in the working tree (submodule git metadata absent); continuing."
+else
     echo "Pinned libsurvive does not match the tested database-import patch." >&2
     exit 1
 fi
