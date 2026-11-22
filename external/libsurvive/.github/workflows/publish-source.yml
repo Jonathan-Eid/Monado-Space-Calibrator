@@ -1,0 +1,56 @@
+name: Publish source
+
+on:
+  push:
+  release:
+    types:
+      - created
+
+jobs:
+  gather-source:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+        submodules: recursive
+    - name: Set bundle name
+      id: bundle
+      working-directory: ${{runner.workspace}}/libsurvive      
+      shell: bash
+      run: echo "BUNDLE_FILE_NAME=libsurvive-$(git describe --tags 2>/dev/null || echo 0.0.0.$(git rev-list --count HEAD))-source.zip" >> "$GITHUB_OUTPUT"
+
+    - name: Generate version
+      working-directory: ${{runner.workspace}}/libsurvive
+      run: git describe --dirty --tags > VERSION 2>/dev/null || echo "0.0.0.$(git rev-list --count HEAD)" > VERSION
+
+    - name: Remove git directories
+      working-directory: ${{runner.workspace}}/libsurvive
+      run: rm -rf .git
+
+    - name: Bundle
+      working-directory: ${{runner.workspace}}/libsurvive
+      run: 7z a ${{runner.workspace}}/${{ steps.bundle.outputs.BUNDLE_FILE_NAME }} ${{runner.workspace}}/libsurvive
+
+    - uses: actions/upload-artifact@v7
+      name: Upload
+      with:
+        name: ${{ steps.bundle.outputs.BUNDLE_FILE_NAME }}
+        path: ${{runner.workspace}}
+
+    - name: Upload Release Asset
+      if: github.event_name == 'release' && github.repository == 'collabora/libsurvive'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        # Only publish if the Build and Test workflow passed for this commit
+        conclusion=$(gh run list --repo "${{ github.repository }}" --workflow cmake.yml --commit "${{ github.sha }}" --status completed --json conclusion --jq '[.[].conclusion] | first')
+        if [ "$conclusion" != "success" ]; then
+          echo "Build and Test did not succeed for ${{ github.sha }} (conclusion: ${conclusion:-none}); not publishing"
+          exit 1
+        fi
+        gh release upload "${{ github.event.release.tag_name }}" "${{runner.workspace}}/${{steps.bundle.outputs.BUNDLE_FILE_NAME}}" --clobber

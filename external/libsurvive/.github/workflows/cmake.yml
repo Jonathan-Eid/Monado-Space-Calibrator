@@ -1,0 +1,122 @@
+name: Build and Test
+
+on:
+  pull_request:
+  push:
+  release:
+    types:
+      - created
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Release]
+        os: [ubuntu-24.04, windows-latest]
+        include:
+        - os: ubuntu-24.04
+          build_type: Debug
+          config_flags: "-DUSE_ASAN=ON"
+          deps: libasan8
+        - os: windows-latest
+          build_type: Debug
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+        submodules: recursive
+    - if: contains(matrix.os, 'ubuntu')
+      name: Get Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install p7zip-full build-essential zlib1g-dev libx11-dev libusb-1.0-0-dev freeglut3-dev liblapacke-dev libopenblas-dev libpcap-dev python3 python3-pip apt-transport-https libpcap-dev ninja-build libeigen3-dev ${{ matrix.deps }}
+    - uses: actions/setup-python@v7
+      with:
+        python-version: '3.x'
+    - name: Setup windows flags
+      if: contains(matrix.os, 'windows') && matrix.build_type == 'Release'
+      id: flags
+      shell: bash
+      run: echo "SETUP_PY_FLAGS=-G 'Visual Studio 17 2022'" >> "$GITHUB_OUTPUT"
+    - name: Get mac dependencies
+      if: contains(matrix.os, 'macos')
+      run: |
+        brew install freeglut lapack libusb openblas
+        brew info libusb
+        brew ls libusb
+    - name: Create Build Environment
+      # Some projects don't allow in-source building, so create a separate build directory
+      # We'll use this as our working directory for all subsequent commands
+      run: cmake -E make_directory ${{runner.workspace}}/build
+
+    - name: Configure CMake
+      # Use a bash shell so we can use the same syntax for environment variable
+      # access regardless of the host operating system
+      shell: bash
+      working-directory: ${{runner.workspace}}/build
+      # Note the current convention is to use the -S and -B options here to specify source 
+      # and build directories, but this is only available with CMake 3.13 and higher.  
+      # The CMake binaries on the Github Actions machines are (as of this writing) 3.12
+      run: cmake $GITHUB_WORKSPACE -DUSE_EIGEN=On -DDOWNLOAD_EIGEN=On -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DENABLE_TESTS=ON -DCMAKE_INSTALL_PREFIX=install_root ${{matrix.config_flags}}
+
+    - name: Build
+      working-directory: ${{runner.workspace}}/build
+      shell: bash
+      # Execute the build.  You can specify a specific target with "--target <NAME>"
+      run: cmake --build . --config $BUILD_TYPE -v
+    
+    - name: Install
+      working-directory: ${{runner.workspace}}/build
+      shell: bash
+      # Execute the build.  You can specify a specific target with "--target <NAME>"
+      run: cmake --build . --config $BUILD_TYPE --target install
+
+    - name: Set bundle name
+      id: bundle
+      shell: bash
+      run: echo "BUNDLE_FILE_NAME=libsurvive-$(git describe --tags 2>/dev/null || echo 0.0.0.$(git rev-list --count HEAD))-${{ matrix.os }}.zip" >> "$GITHUB_OUTPUT"
+
+    - name: Bundle
+      if: matrix.build_type == 'Release'
+      working-directory: ${{runner.workspace}}/libsurvive
+      run: 7z a ${{runner.workspace}}/build/${{ steps.bundle.outputs.BUNDLE_FILE_NAME }} ${{runner.workspace}}/build/install_root/*
+
+    - uses: actions/upload-artifact@v7
+      name: Upload
+      if: matrix.build_type == 'Release'
+      with:
+        name: libsurvive-${{ matrix.os }}-${{ matrix.build_type }}
+        path: | 
+          ${{runner.workspace}}/build/${{steps.bundle.outputs.BUNDLE_FILE_NAME}}
+          ${{runner.workspace}}/libsurvive/dist/*.whl
+    - name: Test
+      if: runner.os == 'Linux'
+      working-directory: ${{runner.workspace}}/build
+      shell: bash
+      # Execute tests defined by the CMake configuration.
+      # See https://cmake.org/cmake/help/latest/manual/ctest.1.html for more detail
+      run: ctest -C $BUILD_TYPE --output-on-failure --parallel
+      env:
+        LSAN_OPTIONS: suppressions=${{runner.workspace}}/libsurvive/useful_files/leak_suppressions.txt 
+
+  release:
+    name: Upload release assets
+    needs: build
+    if: github.event_name == 'release' && github.repository == 'collabora/libsurvive'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/download-artifact@v8
+      with:
+        pattern: libsurvive-*-Release
+        path: artifacts
+    - name: Upload Release Asset
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: find artifacts -name '*.zip' -exec gh release upload "${{ github.event.release.tag_name }}" {} --clobber --repo "${{ github.repository }}" \;
